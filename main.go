@@ -1,6 +1,7 @@
 package main
 
 import (
+    "flag"
 	"context"
 	"fmt"
 	"log"
@@ -273,6 +274,16 @@ func (gcs *GCSConfig) dateRange(key string) ([]string, error) {
 
 func main() {
 
+    sourceSelectFlag := flag.String(
+        "src",
+        "both",
+        "Which sources to replicate, default is both. Options: [daily, intraday, both]",
+    )
+
+    flag.Parse()
+
+    sourceSelect := *sourceSelectFlag
+
     var gcs GCSConfig
 
     gcsCfgYaml, err := os.ReadFile("./gcs.yaml")
@@ -285,7 +296,15 @@ func main() {
         log.Fatal(err)
     }
 
-    repl := []string{"daily", "intraday"}
+    var repl []string
+
+    if sourceSelect == "daily" || sourceSelect == "intraday" {
+        repl = []string{sourceSelect}
+    } else if sourceSelect == "both" {
+        repl = []string{"daily", "intraday"}
+    } else {
+        log.Fatal("src flag is not a validate option.")
+    }
 
     for i := range repl {
         key := repl[i]
