@@ -225,6 +225,52 @@ func createDate(timezone string, replicationTarget string) string {
     return now.In(tz).Format("20060102")
 }
 
+func generateDateRange(dateStartStr string, dateEndStr string) []string {
+    dateStart, err := time.Parse("20060102", dateStartStr)
+    if err != nil {
+        log.Fatalf("dataRangeStart not in YYYYMMDD format")
+    }
+
+    dateEnd, err := time.Parse("20060102", dateEndStr)
+    if err != nil {
+        log.Fatalf("dataRangeEnd not in YYYYMMDD format")
+    }
+
+    dateSlice := []string{dateStartStr, dateEndStr}
+
+    diff := dateEnd.Sub(dateStart)
+
+    daysDiff := int(diff.Hours() / 24)
+
+    for i := 1; i < daysDiff; i++ {
+        dateSlice = append(
+            dateSlice,
+            dateStart.AddDate(0, 0, i).Format("20060102"),
+        )
+    }
+
+    return dateSlice
+}
+
+func (gcs *GCSConfig) dateRange(key string) ([]string, error) {
+    var dateRangeSlice []string
+    if gcs.Sources[key].ReplicationScheme == "today" {
+        dateRangeSlice = append(dateRangeSlice, createDate(gcs.Timezone, key))
+    } else if gcs.Sources[key].ReplicationScheme == "range" {
+        dateRangeSlice = append(
+            dateRangeSlice,
+            generateDateRange(
+                gcs.Sources[key].DateRangeStart,
+                gcs.Sources[key].DateRangeEnd,
+            )...,
+        )
+    } else {
+        return nil, fmt.Errorf("Replication scheme must be one of these options [today, range]")
+    }
+
+    return dateRangeSlice, nil
+}
+
 func main() {
 
     var gcs GCSConfig
@@ -240,7 +286,6 @@ func main() {
     }
 
     repl := []string{"daily", "intraday"}
-    // repl := []string{"intraday"}
 
     for i := range repl {
         key := repl[i]
@@ -250,20 +295,27 @@ func main() {
             log.Fatal(err)
         }
 
-        srcTable := fmt.Sprintf(
-            "%s%s",
-            gcs.Sources[key].TablePrefix,
-            createDate(gcs.Timezone, key),
-        )
-
-        err = exportTableAsShardedJSON(
-            gcs.ProjectID,
-            gcs.Schema,
-            srcTable,
-            makeGCSPath(gcs.Sources[key].Bucket, gcs.Sources[key].BucketSuffix),
-        )
+        dateRange, err := gcs.dateRange(key)
         if err != nil {
-            log.Fatalf("Error exporting table: %s", err)
+            log.Fatal(err)
+        }
+
+        for d := range dateRange {
+            srcTable := fmt.Sprintf(
+                "%s%s",
+                gcs.Sources[key].TablePrefix,
+                dateRange[d],
+            )
+
+            err = exportTableAsShardedJSON(
+                gcs.ProjectID,
+                gcs.Schema,
+                srcTable,
+                makeGCSPath(gcs.Sources[key].Bucket, gcs.Sources[key].BucketSuffix),
+            )
+            if err != nil {
+                log.Fatalf("Error exporting table: %s", err)
+            }
         }
 
         invokeSling(string(slingCfg))
