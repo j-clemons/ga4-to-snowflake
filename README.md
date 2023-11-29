@@ -14,6 +14,8 @@ This tool requires configuration yaml files to provide the replication details f
 ## gcs.yaml
 This is the primary config file that provides the details for each source. An example is provided below.
 
+The path for where this config file is stored needs to be set in the `GA4_SNOWFLAKE_CONFIG` environment variable.
+
 The `replicationScheme` setting instructs the tool to either replicate over a set date range or if set to `today` the prior day's daily export and the current date's intraday file.
 ```
 projectID: [GCP Project ID]

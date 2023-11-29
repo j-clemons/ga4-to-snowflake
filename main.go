@@ -286,7 +286,7 @@ func main() {
 
     var gcs GCSConfig
 
-    gcsCfgYaml, err := os.ReadFile("./gcs.yaml")
+    gcsCfgYaml, err := os.ReadFile(os.Getenv("GA4_SNOWFLAKE_CONFIG"))
     if err != nil {
         log.Fatal(err)
     }
