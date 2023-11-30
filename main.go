@@ -237,13 +237,13 @@ func generateDateRange(dateStartStr string, dateEndStr string) []string {
         log.Fatalf("dataRangeEnd not in YYYYMMDD format")
     }
 
-    dateSlice := []string{dateStartStr, dateEndStr}
+    dateSlice := []string{dateStartStr}
 
     diff := dateEnd.Sub(dateStart)
 
     daysDiff := int(diff.Hours() / 24)
 
-    for i := 1; i < daysDiff; i++ {
+    for i := 1; i <= daysDiff; i++ {
         dateSlice = append(
             dateSlice,
             dateStart.AddDate(0, 0, i).Format("20060102"),
@@ -335,17 +335,17 @@ func main() {
             if err != nil {
                 log.Fatalf("Error exporting table: %s", err)
             }
-        }
 
-        invokeSling(string(slingCfg))
+            invokeSling(string(slingCfg))
 
-        err = emptyBucketDirectory(
-            gcs.Sources[key].Bucket,
-            gcs.Sources[key].BucketSuffix,
-            gcs.Sources[key].FileFormat,
-        )
-        if err != nil {
-            log.Fatalf("Error deleting files: %s", err)
+            err = emptyBucketDirectory(
+                gcs.Sources[key].Bucket,
+                gcs.Sources[key].BucketSuffix,
+                gcs.Sources[key].FileFormat,
+            )
+            if err != nil {
+                log.Fatalf("Error deleting files: %s", err)
+            }
         }
     }
 }
