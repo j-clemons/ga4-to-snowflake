@@ -8,6 +8,7 @@ import (
 	"os"
 	"regexp"
 	"time"
+    "strings"
 
 	"cloud.google.com/go/bigquery"
 	"cloud.google.com/go/storage"
@@ -34,6 +35,43 @@ type Source struct {
     DateRangeStart    string `yaml:"dateRangeStart"`
     DateRangeEnd      string `yaml:"dateRangeEnd"`
     SlingCfgPath      string `yaml:"slingCfgPath"`
+}
+
+type SlingConfig struct {
+    Source struct {
+        Conn   string `yaml:"conn"`
+        Stream string `yaml:"stream"`
+    } `yaml:"source"`
+    Target struct {
+        Conn   string `yaml:"conn"`
+        Object string `yaml:"object"`
+    } `yaml:"target"`
+    Mode string `yaml:"mode"`
+}
+
+func listTablesWithPrefix(projectID string, datasetID string, prefix string) ([]string, error) {
+    ctx := context.Background()
+    client, err := bigquery.NewClient(ctx, projectID)
+    if err != nil {
+        return nil, fmt.Errorf("bigquery.NewClient: %w", err)
+    }
+    defer client.Close()
+
+    tableNames := []string{}
+    ts := client.Dataset(datasetID).Tables(ctx)
+    for {
+        t, err := ts.Next()
+        if err == iterator.Done {
+            break
+        }
+        if err != nil {
+            return nil, err
+        }
+        if strings.HasPrefix(t.TableID, prefix) {
+            tableNames = append(tableNames, t.TableID)
+        }
+    }
+    return tableNames, nil
 }
 
 // exportTableAsCompressedCSV demonstrates using an export job to
@@ -253,10 +291,14 @@ func generateDateRange(dateStartStr string, dateEndStr string) []string {
     return dateSlice
 }
 
-func (gcs *GCSConfig) dateRange(key string) ([]string, error) {
+func (gcs *GCSConfig) selectTables(key string, availableTables []string) ([]string, error) {
+    var tableSlice []string
     var dateRangeSlice []string
+
     if gcs.Sources[key].ReplicationScheme == "today" {
         dateRangeSlice = append(dateRangeSlice, createDate(gcs.Timezone, key))
+    } else if gcs.Sources[key].ReplicationScheme == "all-time" {
+        tableSlice = append(tableSlice, availableTables...)
     } else if gcs.Sources[key].ReplicationScheme == "range" {
         dateRangeSlice = append(
             dateRangeSlice,
@@ -266,10 +308,25 @@ func (gcs *GCSConfig) dateRange(key string) ([]string, error) {
             )...,
         )
     } else {
-        return nil, fmt.Errorf("Replication scheme must be one of these options [today, range]")
+        return nil, fmt.Errorf("Replication scheme must be one of these options [today, range, all-time]")
     }
 
-    return dateRangeSlice, nil
+    for _, d := range dateRangeSlice {
+        tableSlice = append(
+            tableSlice,
+            fmt.Sprintf("%s%s", gcs.Sources[key].TablePrefix, d),
+        )
+    }
+
+    return tableSlice, nil
+}
+
+func (slc *SlingConfig) toYamlString() string {
+    slcYaml, err := yaml.Marshal(&slc)
+    if err != nil {
+        log.Fatal(err)
+    }
+    return string(slcYaml)
 }
 
 func main() {
@@ -314,38 +371,70 @@ func main() {
             log.Fatal(err)
         }
 
-        dateRange, err := gcs.dateRange(key)
+        var slcfg SlingConfig
+
+        err = yaml.Unmarshal(slingCfg, &slcfg)
         if err != nil {
             log.Fatal(err)
         }
 
-        for d := range dateRange {
-            srcTable := fmt.Sprintf(
-                "%s%s",
-                gcs.Sources[key].TablePrefix,
-                dateRange[d],
-            )
+        tableList, err := listTablesWithPrefix(gcs.ProjectID, gcs.Schema, gcs.Sources[key].TablePrefix)
+        if err != nil {
+            log.Fatal(err)
+        }
 
+        tablesToReplicate, err := gcs.selectTables(key, tableList)
+
+        for _, table := range tablesToReplicate {
             err = exportTableAsShardedJSON(
                 gcs.ProjectID,
                 gcs.Schema,
-                srcTable,
+                table,
                 makeGCSPath(gcs.Sources[key].Bucket, gcs.Sources[key].BucketSuffix),
             )
             if err != nil {
                 log.Fatalf("Error exporting table: %s", err)
             }
+        }
 
-            invokeSling(string(slingCfg))
+        bucketContents, err := listFilesWithPrefix(
+            gcs.Sources[key].Bucket,
+            gcs.Sources[key].BucketSuffix,
+            "/",
+        )
+        if err != nil {
+            log.Fatal(err)
+        }
 
-            err = emptyBucketDirectory(
-                gcs.Sources[key].Bucket,
-                gcs.Sources[key].BucketSuffix,
-                gcs.Sources[key].FileFormat,
-            )
-            if err != nil {
-                log.Fatalf("Error deleting files: %s", err)
+        filesInBucket := []string{}
+        for _, f := range bucketContents {
+            if f[len(f)-4:] == "json" {
+                filesInBucket = append(
+                    filesInBucket,
+                    fmt.Sprintf("gs://%s/%s", gcs.Sources[key].Bucket, f),
+                )
             }
+        }
+
+        for i, f := range filesInBucket {
+            newSlingCfg := slcfg
+            newSlingCfg.Source.Stream = f
+            if i == 0 && key == "intraday" {
+                newSlingCfg.Mode = "full-refresh"
+                invokeSling(newSlingCfg.toYamlString())
+            } else {
+                invokeSling(newSlingCfg.toYamlString())
+            }
+            log.Printf("file loaded: %s \n", f)
+        }
+
+        err = emptyBucketDirectory(
+            gcs.Sources[key].Bucket,
+            gcs.Sources[key].BucketSuffix,
+            gcs.Sources[key].FileFormat,
+        )
+        if err != nil {
+            log.Fatalf("Error deleting files: %s", err)
         }
     }
 }
