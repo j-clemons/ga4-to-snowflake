@@ -20,10 +20,11 @@ import (
 )
 
 type GCSConfig struct {
-    ProjectID string   `yaml:"projectID"`
-    Schema    string   `yaml:"schema"`
-    Timezone  string   `yaml:"timezone"`
-    Sources   map[string]Source `yaml:"sources"`
+    ProjectID      string            `yaml:"projectID"`
+    Schema         string            `yaml:"schema"`
+    Timezone       string            `yaml:"timezone"`
+    ExportStrategy string            `yaml:"exportStrategy"`
+    Sources        map[string]Source `yaml:"sources"`
 }
 
 type Source struct {
@@ -86,7 +87,7 @@ func exportTableAsShardedJSON(srcProjectID string, srcDataset string, srcTable s
     }
     defer client.Close()
 
-    gcsURI := fmt.Sprintf("%s/%s_*.json", gcsPath, srcTable)
+    gcsURI := fmt.Sprintf("%s%s/%s_*.json", gcsPath, srcTable, srcTable)
 
     gcsRef := bigquery.NewGCSReference(gcsURI)
     gcsRef.DestinationFormat = bigquery.JSON
@@ -211,7 +212,14 @@ func parseGCSBucketContents(contents []string, fileFormatSuffix string) ([]strin
     return matchingFiles, nil
 }
 
-func emptyBucketDirectory(bucketName string, filePrefix string, fileFormatSuffix string) error {
+func (gcs *GCSConfig) emptyBucketDirectory(key string, prefixExtension string) error {
+    bucketName := gcs.Sources[key].Bucket
+    filePrefix := gcs.Sources[key].BucketSuffix
+    if prefixExtension != "" {
+        filePrefix = fmt.Sprintf("%s/%s", filePrefix, prefixExtension)
+    }
+    fileFormatSuffix := gcs.Sources[key].FileFormat
+
     bucketContents, err := listFilesWithPrefix(
         bucketName,
         filePrefix,
@@ -386,6 +394,15 @@ func main() {
         tablesToReplicate, err := gcs.selectTables(key, tableList)
 
         for _, table := range tablesToReplicate {
+            err = gcs.emptyBucketDirectory(key, table)
+            if err != nil {
+                if err.Error() == "Input slice has no files of json format" {
+                    log.Printf("No files to delete for table: %s", table)
+                } else {
+                    log.Fatalf("Error deleting files: %s", err)
+                }
+            }
+
             err = exportTableAsShardedJSON(
                 gcs.ProjectID,
                 gcs.Schema,
@@ -400,7 +417,7 @@ func main() {
         bucketContents, err := listFilesWithPrefix(
             gcs.Sources[key].Bucket,
             gcs.Sources[key].BucketSuffix,
-            "/",
+            "",
         )
         if err != nil {
             log.Fatal(err)
@@ -428,13 +445,25 @@ func main() {
             log.Printf("file loaded: %s \n", f)
         }
 
-        err = emptyBucketDirectory(
-            gcs.Sources[key].Bucket,
-            gcs.Sources[key].BucketSuffix,
-            gcs.Sources[key].FileFormat,
-        )
-        if err != nil {
-            log.Fatalf("Error deleting files: %s", err)
+        if key == "daily" &&
+        gcs.Sources[key].ReplicationScheme == "today" &&
+        gcs.ExportStrategy == "daily+streaming" {
+            err = gcs.emptyBucketDirectory(key, "")
+            if err != nil {
+                log.Fatalf("Error deleting files: %s", err)
+            }
+
+            intradayDirName := strings.Replace(
+                tablesToReplicate[0],
+                gcs.Sources[key].TablePrefix,
+                gcs.Sources["intraday"].TablePrefix,
+                1,
+            )
+
+            err = gcs.emptyBucketDirectory("intraday", intradayDirName)
+            if err != nil {
+                log.Fatalf("Error deleting files: %s", err)
+            }
         }
     }
 }
