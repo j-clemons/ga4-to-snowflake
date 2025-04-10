@@ -50,7 +50,27 @@ type SlingConfig struct {
     Mode string `yaml:"mode"`
 }
 
-func listTablesWithPrefix(projectID string, datasetID string, prefix string) ([]string, error) {
+func readSlingConfig(cfgPath string) SlingConfig {
+    slingCfg, err := os.ReadFile(cfgPath)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    var slcfg SlingConfig
+
+    err = yaml.Unmarshal(slingCfg, &slcfg)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    return slcfg
+}
+
+func (gcs *GCSConfig) listTablesWithPrefix(source string) ([]string, error) {
+    projectID := gcs.ProjectID
+    datasetID := gcs.Schema
+    prefix := gcs.Sources[source].TablePrefix
+
     ctx := context.Background()
     client, err := bigquery.NewClient(ctx, projectID)
     if err != nil {
@@ -77,7 +97,9 @@ func listTablesWithPrefix(projectID string, datasetID string, prefix string) ([]
 
 // exportTableAsCompressedCSV demonstrates using an export job to
 // write the contents of a table into Cloud Storage as CSV.
-func exportTableAsShardedJSON(srcProjectID string, srcDataset string, srcTable string, gcsPath string) error {
+func (gcs *GCSConfig) exportTableAsShardedJSON(srcTable string, gcsPath string) error {
+    srcProjectID := gcs.ProjectID
+    srcDataset := gcs.Schema
     // projectID := "my-project-id"
     // gcsPath := "gs://mybucket"
     ctx := context.Background()
@@ -216,14 +238,14 @@ func (gcs *GCSConfig) emptyBucketDirectory(key string, prefixExtension string) e
     bucketName := gcs.Sources[key].Bucket
     filePrefix := gcs.Sources[key].BucketSuffix
     if prefixExtension != "" {
-        filePrefix = fmt.Sprintf("%s/%s", filePrefix, prefixExtension)
+        filePrefix = fmt.Sprintf("%s%s/", filePrefix, prefixExtension)
     }
     fileFormatSuffix := gcs.Sources[key].FileFormat
 
     bucketContents, err := listFilesWithPrefix(
         bucketName,
         filePrefix,
-        "/",
+        "",
     )
     if err != nil {
         return err
@@ -374,19 +396,9 @@ func main() {
     for i := range repl {
         key := repl[i]
 
-        slingCfg, err := os.ReadFile(gcs.Sources[key].SlingCfgPath)
-        if err != nil {
-            log.Fatal(err)
-        }
+        slcfg := readSlingConfig(gcs.Sources[key].SlingCfgPath)
 
-        var slcfg SlingConfig
-
-        err = yaml.Unmarshal(slingCfg, &slcfg)
-        if err != nil {
-            log.Fatal(err)
-        }
-
-        tableList, err := listTablesWithPrefix(gcs.ProjectID, gcs.Schema, gcs.Sources[key].TablePrefix)
+        tableList, err := gcs.listTablesWithPrefix(key)
         if err != nil {
             log.Fatal(err)
         }
@@ -403,9 +415,7 @@ func main() {
                 }
             }
 
-            err = exportTableAsShardedJSON(
-                gcs.ProjectID,
-                gcs.Schema,
+            err = gcs.exportTableAsShardedJSON(
                 table,
                 makeGCSPath(gcs.Sources[key].Bucket, gcs.Sources[key].BucketSuffix),
             )
@@ -450,7 +460,7 @@ func main() {
         gcs.ExportStrategy == "daily+streaming" {
             err = gcs.emptyBucketDirectory(key, "")
             if err != nil {
-                log.Fatalf("Error deleting files: %s", err)
+                log.Fatalf("Error deleting daily files: %s", err)
             }
 
             intradayDirName := strings.Replace(
@@ -462,8 +472,14 @@ func main() {
 
             err = gcs.emptyBucketDirectory("intraday", intradayDirName)
             if err != nil {
-                log.Fatalf("Error deleting files: %s", err)
+                if err.Error() == "Input slice has no files of json format" {
+                    log.Printf("No intraday files to delete: %s", intradayDirName)
+                } else {
+                    log.Fatalf("Error deleting files: %s", err)
+                }
             }
         }
+
+        log.Printf("Replication completed for %s \n", key)
     }
 }
