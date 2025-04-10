@@ -21,6 +21,7 @@ The `replicationScheme` setting instructs the tool to either replicate over a se
 projectID: [GCP Project ID]
 schema: [Dataset where the GA4 exports are sent. Default is analytics_######]
 timezone: [Timezone string. Ex America/Chicago]
+exportStrategy: [daily, streaming, daily+streaming]
 
 sources:
   daily:
