@@ -20,10 +20,11 @@ import (
 )
 
 type GCSConfig struct {
-    ProjectID string   `yaml:"projectID"`
-    Schema    string   `yaml:"schema"`
-    Timezone  string   `yaml:"timezone"`
-    Sources   map[string]Source `yaml:"sources"`
+    ProjectID      string            `yaml:"projectID"`
+    Schema         string            `yaml:"schema"`
+    Timezone       string            `yaml:"timezone"`
+    ExportStrategy string            `yaml:"exportStrategy"`
+    Sources        map[string]Source `yaml:"sources"`
 }
 
 type Source struct {
@@ -49,7 +50,27 @@ type SlingConfig struct {
     Mode string `yaml:"mode"`
 }
 
-func listTablesWithPrefix(projectID string, datasetID string, prefix string) ([]string, error) {
+func readSlingConfig(cfgPath string) SlingConfig {
+    slingCfg, err := os.ReadFile(cfgPath)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    var slcfg SlingConfig
+
+    err = yaml.Unmarshal(slingCfg, &slcfg)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    return slcfg
+}
+
+func (gcs *GCSConfig) listTablesWithPrefix(source string) ([]string, error) {
+    projectID := gcs.ProjectID
+    datasetID := gcs.Schema
+    prefix := gcs.Sources[source].TablePrefix
+
     ctx := context.Background()
     client, err := bigquery.NewClient(ctx, projectID)
     if err != nil {
@@ -76,7 +97,9 @@ func listTablesWithPrefix(projectID string, datasetID string, prefix string) ([]
 
 // exportTableAsCompressedCSV demonstrates using an export job to
 // write the contents of a table into Cloud Storage as CSV.
-func exportTableAsShardedJSON(srcProjectID string, srcDataset string, srcTable string, gcsPath string) error {
+func (gcs *GCSConfig) exportTableAsShardedJSON(srcTable string, gcsPath string) error {
+    srcProjectID := gcs.ProjectID
+    srcDataset := gcs.Schema
     // projectID := "my-project-id"
     // gcsPath := "gs://mybucket"
     ctx := context.Background()
@@ -86,7 +109,7 @@ func exportTableAsShardedJSON(srcProjectID string, srcDataset string, srcTable s
     }
     defer client.Close()
 
-    gcsURI := fmt.Sprintf("%s/%s_*.json", gcsPath, srcTable)
+    gcsURI := fmt.Sprintf("%s%s/%s_*.json", gcsPath, srcTable, srcTable)
 
     gcsRef := bigquery.NewGCSReference(gcsURI)
     gcsRef.DestinationFormat = bigquery.JSON
@@ -211,11 +234,18 @@ func parseGCSBucketContents(contents []string, fileFormatSuffix string) ([]strin
     return matchingFiles, nil
 }
 
-func emptyBucketDirectory(bucketName string, filePrefix string, fileFormatSuffix string) error {
+func (gcs *GCSConfig) emptyBucketDirectory(key string, prefixExtension string) error {
+    bucketName := gcs.Sources[key].Bucket
+    filePrefix := gcs.Sources[key].BucketSuffix
+    if prefixExtension != "" {
+        filePrefix = fmt.Sprintf("%s%s/", filePrefix, prefixExtension)
+    }
+    fileFormatSuffix := gcs.Sources[key].FileFormat
+
     bucketContents, err := listFilesWithPrefix(
         bucketName,
         filePrefix,
-        "/",
+        "",
     )
     if err != nil {
         return err
@@ -366,19 +396,9 @@ func main() {
     for i := range repl {
         key := repl[i]
 
-        slingCfg, err := os.ReadFile(gcs.Sources[key].SlingCfgPath)
-        if err != nil {
-            log.Fatal(err)
-        }
+        slcfg := readSlingConfig(gcs.Sources[key].SlingCfgPath)
 
-        var slcfg SlingConfig
-
-        err = yaml.Unmarshal(slingCfg, &slcfg)
-        if err != nil {
-            log.Fatal(err)
-        }
-
-        tableList, err := listTablesWithPrefix(gcs.ProjectID, gcs.Schema, gcs.Sources[key].TablePrefix)
+        tableList, err := gcs.listTablesWithPrefix(key)
         if err != nil {
             log.Fatal(err)
         }
@@ -386,9 +406,16 @@ func main() {
         tablesToReplicate, err := gcs.selectTables(key, tableList)
 
         for _, table := range tablesToReplicate {
-            err = exportTableAsShardedJSON(
-                gcs.ProjectID,
-                gcs.Schema,
+            err = gcs.emptyBucketDirectory(key, table)
+            if err != nil {
+                if err.Error() == "Input slice has no files of json format" {
+                    log.Printf("No files to delete for table: %s", table)
+                } else {
+                    log.Fatalf("Error deleting files: %s", err)
+                }
+            }
+
+            err = gcs.exportTableAsShardedJSON(
                 table,
                 makeGCSPath(gcs.Sources[key].Bucket, gcs.Sources[key].BucketSuffix),
             )
@@ -400,7 +427,7 @@ func main() {
         bucketContents, err := listFilesWithPrefix(
             gcs.Sources[key].Bucket,
             gcs.Sources[key].BucketSuffix,
-            "/",
+            "",
         )
         if err != nil {
             log.Fatal(err)
@@ -428,13 +455,31 @@ func main() {
             log.Printf("file loaded: %s \n", f)
         }
 
-        err = emptyBucketDirectory(
-            gcs.Sources[key].Bucket,
-            gcs.Sources[key].BucketSuffix,
-            gcs.Sources[key].FileFormat,
-        )
-        if err != nil {
-            log.Fatalf("Error deleting files: %s", err)
+        if key == "daily" &&
+        gcs.Sources[key].ReplicationScheme == "today" &&
+        gcs.ExportStrategy == "daily+streaming" {
+            err = gcs.emptyBucketDirectory(key, "")
+            if err != nil {
+                log.Fatalf("Error deleting daily files: %s", err)
+            }
+
+            intradayDirName := strings.Replace(
+                tablesToReplicate[0],
+                gcs.Sources[key].TablePrefix,
+                gcs.Sources["intraday"].TablePrefix,
+                1,
+            )
+
+            err = gcs.emptyBucketDirectory("intraday", intradayDirName)
+            if err != nil {
+                if err.Error() == "Input slice has no files of json format" {
+                    log.Printf("No intraday files to delete: %s", intradayDirName)
+                } else {
+                    log.Fatalf("Error deleting files: %s", err)
+                }
+            }
         }
+
+        log.Printf("Replication completed for %s \n", key)
     }
 }
